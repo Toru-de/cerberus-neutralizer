@@ -9,7 +9,10 @@ local attackRecord = "CerberusBoss.CerberusAttacks"
 local function makeNPC(key, record, visual, hearing)
     local id = { hash = key }
     local senses = { visual = visual, hearing = hearing, preset = relaxedPreset, detection = 50, resets = 0 }
-    local npc = { attached = true, inScene = false, inWorkspot = false, dead = false, senses = senses }
+    local npc = {
+        attached = true, inScene = false, inWorkspot = false, dead = false, senses = senses,
+        position = { x = 0, y = 0, z = 0 },
+    }
 
     function npc:IsA(class) return class == "NPCPuppet" end
     function npc:IsPlayer() return record == "Player" end
@@ -19,6 +22,10 @@ local function makeNPC(key, record, visual, hearing)
     function npc:IsAttached() return self.attached end
     function npc:IsDead() return self.dead end
     function npc:GetSensesComponent() return senses end
+    function npc:GetWorldPosition()
+        assert(not self.positionError, "simulated position API error")
+        return self.position
+    end
 
     function senses:GetOwnerPuppet() return npc end
     function senses:GetCurrentPreset() return self.preset end
@@ -100,10 +107,21 @@ local function start(options)
     }
 
     local noop = function() end
+    GetDisplayResolution = function() return 1920, 1080 end
+    ImGuiCond = { Always = 1 }
+    ImGuiWindowFlags = {
+        NoDecoration = 1, NoInputs = 2, AlwaysAutoResize = 4, NoSavedSettings = 8,
+        NoFocusOnAppearing = 16, NoDocking = 32,
+    }
     ImGui = {
-        Begin = function() return true end,
+        Begin = function(name, flags)
+            if name == "##CerberusNeutralizerHUD" then assert(flags == 63) end
+            state.drawnWindow = name
+            return true
+        end,
         End = noop, BeginDisabled = noop, EndDisabled = noop, Separator = noop,
-        Text = noop, TextWrapped = noop,
+        Text = noop, TextWrapped = noop, SetNextWindowPos = noop, SetNextWindowBgAlpha = noop,
+        TextColored = function(_, _, _, _, value) state.drawnText = value end,
         Checkbox = function(label, value)
             if label == settingToChange then return settingValue, true end
             return value, false
@@ -149,6 +167,12 @@ local function start(options)
         events.onDraw()
         events.onOverlayClose()
         settingToChange = nil
+    end
+    state.hud = function()
+        state.drawnWindow, state.drawnText = nil, nil
+        events.onDraw()
+        assert(not state.drawnWindow or state.drawnWindow == "##CerberusNeutralizerHUD")
+        return state.drawnText
     end
     state.vanillaToggle = function(npc, enabled)
         before["senseComponent.ToggleComponent"](npc.senses, enabled)
@@ -307,4 +331,64 @@ state.tick()
 assert(not state.attackFlag and #state.errors == 0)
 state.stop()
 
-print("PASS: identity, save reload, default patrol, sprint stimuli, cinematic and chase guards, toggles, rollback, and API errors")
+state = start()
+state.load()
+state.tick()
+assert(state.hud() == nil) -- The initial wait never looks like a departure.
+robot = makeNPC("hud-robot", robotRecord, true, true)
+robot.position.x = 12
+state.attach(robot)
+state.tick(0.2)
+assert(state.hud() == "CERBERUS   12 m")
+
+state.set("Disable Cerberus Detection", false)
+state.player.position.x = -10
+state.tick(0.2)
+sensors(robot, true, true)
+assert(state.hud() == "CERBERUS   22 m") -- Only V moved.
+for x = 13, 14 do
+    robot.position.x = x
+    state.tick(0.21)
+end
+assert(state.hud() == "CERBERUS MOVING AWAY   24 m")
+
+state.detach(robot)
+state.tick(0.1)
+assert(state.hud() == "CERBERUS MOVING AWAY   24 m")
+state.tick(0.95)
+assert(state.hud() == "CERBERUS SIGNAL LOST   1 s")
+local returned = makeNPC("hud-replacement", robotRecord, true, true)
+returned.position.x = 2
+state.attach(returned)
+state.tick(0.15)
+assert(state.hud() == "CERBERUS RETURNED   12 m")
+state.tick(3)
+assert(state.hud() == "CERBERUS   12 m")
+
+state.preset(returned, bridgePreset)
+assert(state.hud() == nil)
+state.tick()
+assert(state.hud() == nil)
+state.preset(returned, relaxedPreset)
+state.tick()
+state.set("Show Cerberus HUD", false)
+assert(state.hud() == nil and state.saved.hud == false)
+state.set("Show Cerberus HUD", true)
+state.tick()
+assert(state.hud() == "CERBERUS   12 m")
+state.exitSave()
+assert(state.hud() == nil)
+state.stop()
+assert(#state.errors == 0)
+
+state = start()
+state.load()
+robot = makeNPC("hud-error", robotRecord, true, true)
+robot.positionError = true
+state.attach(robot)
+state.tick()
+sensors(robot, false, false)
+assert(state.hud() == nil and #state.errors == 1)
+state.stop()
+
+print("PASS: patrol protection, sprint stimuli, cinematic guards, rollback, HUD motion, loss and return")

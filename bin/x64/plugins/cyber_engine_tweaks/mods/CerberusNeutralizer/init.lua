@@ -1,10 +1,15 @@
-local VERSION = "0.1.1"
+local VERSION = "0.2.0"
 local QUEST_PATH = "ep1/quests/main_quest/q305_bunker"
 local ROBOT_RECORD = "Character.q305_cerberus_robot"
 local ATTACK_RECORD = "CerberusBoss.CerberusAttacks"
 local ATTACK_FLAT = ATTACK_RECORD .. ".disableAction"
 local SETTINGS_FILE = "settings.json"
-local settings = { enabled = true, detection = true, attacks = false, debug = false }
+local settings = { enabled = true, detection = true, attacks = false, hud = true, debug = false }
+
+local SIGNAL_LOSS_DELAY = 0.6
+local RETURN_NOTICE_DURATION = 2.5
+local RETREAT_SPEED = 0.65
+local RETREAT_DURATION = 0.4
 
 local tracked = {}
 local patrolPresets, chasePresets = {}, {}
@@ -12,9 +17,10 @@ local movementStims = {}
 local robotRecord, activeQuestState
 local overlay, ready, fault = false, false, nil
 local attackAvailable, attackActive, ownsAttackFlat = false, false, false
-local attackFault, stimulusFault
+local attackFault, stimulusFault, hudFault
 local elapsed, pollSoon = 0, true
 local status = "Waiting for CET"
+local hud = {}
 
 local function debugLog(message)
     if settings.debug then
@@ -155,8 +161,13 @@ local function restoreRobot(slot, npc)
     slot.resetFor = nil
 end
 
+local function resetHud()
+    if hud.id then hud = {} end
+end
+
 local function stopEffects()
     updateAttacks(false)
+    resetHud()
     for _, slot in pairs(tracked) do
         if slot.ownsVision or slot.ownsHearing then
             local restored, reason = pcall(function()
@@ -185,14 +196,15 @@ local function guarded(callback, ...)
     if not ok then fail(reason) end
 end
 
-local function isPatrolPreset(preset)
-    for _, chase in ipairs(chasePresets) do
-        if preset == chase then return false end
-    end
-    for _, patrol in ipairs(patrolPresets) do
-        if preset == patrol then return true end
+local function hasPreset(presets, preset)
+    for _, id in ipairs(presets) do
+        if id == preset then return true end
     end
     return false
+end
+
+local function isPatrolPreset(preset)
+    return not hasPreset(chasePresets, preset) and hasPreset(patrolPresets, preset)
 end
 
 local function isGameplayTier(tier)
@@ -232,11 +244,65 @@ local function checkRobot(slot, npc, playerID, playerTier)
         slot.detection = senses:GetDetection(playerID)
         slot.playerTier = playerTier
     end
-    return eligible, suppressed
+    return eligible, suppressed, gameplay and not hasPreset(chasePresets, preset)
 end
 
-local function update()
-    if not settings.enabled or not (settings.detection or (settings.attacks and attackAvailable)) then
+local function distanceBetween(a, b)
+    local x, y, z = a.x - b.x, a.y - b.y, a.z - b.z
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+local function updateHud(player, candidates, protected, delta)
+    if next(candidates) == nil then
+        if protected then
+            resetHud()
+        elseif hud.id then
+            hud.position = nil
+            hud.retreatFor, hud.returnFor = 0, 0
+            hud.lostFor = hud.lostFor + delta
+            if hud.lostFor >= SIGNAL_LOSS_DELAY then
+                hud.message = string.format("CERBERUS SIGNAL LOST   %d s", math.floor(hud.lostFor))
+                hud.color = "lost"
+            end
+        end
+        return
+    end
+
+    local playerPosition = player:GetWorldPosition()
+    local nearestID, nearestPosition, distance
+    for id, npc in pairs(candidates) do
+        local position = npc:GetWorldPosition()
+        local range = distanceBetween(position, playerPosition)
+        if not distance or range < distance then
+            nearestID, nearestPosition, distance = id, position, range
+        end
+    end
+
+    local retreating = false
+    if hud.id == nearestID and hud.position and delta > 0 and delta <= 1 then
+        -- Use V's current position for both samples so running away does not count as robot movement.
+        local previousDistance = distanceBetween(hud.position, playerPosition)
+        retreating = distance - previousDistance > RETREAT_SPEED * delta
+    end
+    hud.retreatFor = retreating and (hud.retreatFor or 0) + delta or 0
+    hud.returnFor = (hud.lostFor or 0) >= SIGNAL_LOSS_DELAY and RETURN_NOTICE_DURATION
+        or math.max(0, (hud.returnFor or 0) - delta)
+    hud.id = nearestID
+    hud.position = { x = nearestPosition.x, y = nearestPosition.y, z = nearestPosition.z }
+    hud.lostFor = 0
+
+    local label = "CERBERUS"
+    hud.color = "near"
+    if hud.returnFor > 0 then
+        label, hud.color = "CERBERUS RETURNED", "returning"
+    elseif hud.retreatFor >= RETREAT_DURATION then
+        label, hud.color = "CERBERUS MOVING AWAY", "away"
+    end
+    hud.message = string.format("%s   %.0f m", label, distance)
+end
+
+local function update(delta)
+    if not settings.enabled or not (settings.hud or settings.detection or (settings.attacks and attackAvailable)) then
         stopEffects()
         setStatus(settings.enabled and "All gameplay changes off" or "Disabled")
         return
@@ -262,14 +328,9 @@ local function update()
         local targeting = Game.GetTargetingSystem()
         if IsDefined(targeting) then remember(targeting:GetLookAtObject(player, false, false)) end
     end
-    if next(tracked) == nil then
-        updateAttacks(false)
-        setStatus("Somewhat Damaged active. Waiting for Cerberus")
-        return
-    end
-
     local playerID = player:GetEntityID()
     local playerTier = PlayerPuppet.GetSceneTier(player)
+    local hudCandidates = settings.hud and not hudFault and isGameplayTier(playerTier) and {} or nil
     local anyPatrol, anyProtected, anySuppressed = false, false, false
     for key, slot in pairs(tracked) do
         local npc = Game.FindEntityByID(slot.id)
@@ -277,7 +338,8 @@ local function update()
             tracked[key] = nil
             debugLog("Detached " .. key)
         else
-            local eligible, suppressed = checkRobot(slot, npc, playerID, playerTier)
+            local eligible, suppressed, canTrack = checkRobot(slot, npc, playerID, playerTier)
+            if hudCandidates and canTrack then hudCandidates[key] = npc end
             anyPatrol = anyPatrol or eligible
             anyProtected = anyProtected or not eligible
             anySuppressed = anySuppressed or suppressed
@@ -293,6 +355,17 @@ local function update()
         setStatus("Cerberus under vanilla control")
     else
         setStatus("Somewhat Damaged active. Waiting for Cerberus")
+    end
+
+    if hudCandidates then
+        local ok, reason = pcall(updateHud, player, hudCandidates, anyProtected, delta)
+        if not ok then
+            hudFault = tostring(reason)
+            spdlog.error("Cerberus HUD unavailable. " .. hudFault)
+            resetHud()
+        end
+    else
+        resetHud()
     end
 end
 
@@ -355,6 +428,7 @@ local function registerObservers()
             if slot and (event.reset or not isPatrolPreset(event.presetID)) then
                 updateAttacks(false)
                 restoreSensors(slot, senses)
+                if hasPreset(chasePresets, event.presetID) then resetHud() end
                 pollSoon = true
             end
         end)
@@ -437,8 +511,9 @@ registerForEvent("onUpdate", function(delta)
     elapsed = elapsed + delta
     local interval = next(tracked) and 0.15 or 0.75
     if pollSoon or elapsed >= interval then
+        local deltaSincePoll = elapsed
         pollSoon, elapsed = false, 0
-        guarded(update)
+        guarded(update, deltaSincePoll)
     end
 end)
 
@@ -455,8 +530,35 @@ local function checkbox(label, key)
     return changed
 end
 
+local hudColors = {
+    near = { 0.96, 0.96, 0.96 },
+    away = { 0.55, 0.88, 1.00 },
+    lost = { 0.78, 0.81, 0.85 },
+    returning = { 1.00, 0.66, 0.31 },
+}
+
+local function drawHud()
+    if not (settings.enabled and settings.hud and hud.message) then return end
+    local width, height = GetDisplayResolution()
+    if width <= 0 or height <= 0 then return end
+
+    local flags = ImGuiWindowFlags.NoDecoration + ImGuiWindowFlags.NoInputs
+        + ImGuiWindowFlags.AlwaysAutoResize + ImGuiWindowFlags.NoSavedSettings
+        + ImGuiWindowFlags.NoFocusOnAppearing + ImGuiWindowFlags.NoDocking
+    ImGui.SetNextWindowPos(width * 0.5, height * 0.07, ImGuiCond.Always, 0.5, 0)
+    ImGui.SetNextWindowBgAlpha(0.82)
+    if ImGui.Begin("##CerberusNeutralizerHUD", flags) then
+        local color = hudColors[hud.color]
+        ImGui.TextColored(color[1], color[2], color[3], 1, hud.message)
+    end
+    ImGui.End()
+end
+
 registerForEvent("onDraw", function()
-    if not overlay then return end
+    if not overlay then
+        drawHud()
+        return
+    end
     if ImGui.Begin("Cerberus Neutralizer") then
         ImGui.Text("v" .. VERSION)
         local enableChanged = checkbox("Enable Cerberus Neutralizer", "enabled")
@@ -466,14 +568,16 @@ registerForEvent("onDraw", function()
         ImGui.EndDisabled()
         ImGui.TextWrapped(attackAvailable and "Blocks the patrol AI attack action. Scripted grabs and chases remain."
             or "Attack action is unavailable in this session.")
+        local hudChanged = checkbox("Show Cerberus HUD", "hud")
         local debugChanged = checkbox("Debug Mode", "debug")
-        if enableChanged or detectionChanged or attacksChanged or debugChanged then saveSettings() end
+        if enableChanged or detectionChanged or attacksChanged or hudChanged or debugChanged then saveSettings() end
 
         ImGui.Separator()
         ImGui.TextWrapped(status)
         if attackActive then ImGui.Text("Patrol attack action disabled") end
         if attackFault then ImGui.TextWrapped(attackFault) end
         if stimulusFault then ImGui.TextWrapped("Stimulus filter unavailable. " .. stimulusFault) end
+        if hudFault then ImGui.TextWrapped("Cerberus HUD unavailable. " .. hudFault) end
         if not attackAvailable and ownsAttackFlat then
             ImGui.TextWrapped("Could not restore the attack flag. Restart the game to restore it.")
         end
