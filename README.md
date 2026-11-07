@@ -1,0 +1,40 @@
+# Cerberus Neutralizer
+
+Мод для Cyberpunk 2077 **2.5** и Phantom Liberty. В задании **Somewhat Damaged («Взгляд в бездну»)** он отключает зрение и слух патрульного Cerberus, чтобы можно было заниматься терминалами и головоломками. Подходит для установки перед загрузкой существующего сохранения внутри Cynosure.
+
+## Установка на облачный ПК
+
+1. Закройте игру. Установите **Cyber Engine Tweaks 1.38.1** в папку игры. Поддержка патча 2.5 появилась в CET 1.38.0. [Скачать CET 1.38.1](https://github.com/maximegmd/CyberEngineTweaks/releases/tag/v1.38.1)
+2. Распакуйте `CerberusNeutralizer-v0.1.0.zip` в корень `Cyberpunk 2077`, объединив папки `bin`. Итоговый путь должен быть `Cyberpunk 2077/bin/x64/plugins/cyber_engine_tweaks/mods/CerberusNeutralizer/init.lua`. [Скачать ZIP](https://github.com/Toru-de/cerberus-neutralizer/releases/download/v0.1.0/CerberusNeutralizer-v0.1.0.zip)
+3. Запустите игру и загрузите свой сейв. Откройте оверлей CET назначенной клавишей. Когда патруль загружен и его сенсоры отключены, окно мода покажет **Cerberus patrol sensors suppressed**.
+
+На облачном ПК нужен доступ к файлам игры и возможность запуска CET. Единственная зависимость мода — CET. [Руководство по установке CET](https://wiki.redmodding.org/cyber-engine-tweaks/getting-started/installing)
+
+## Настройки в оверлее CET
+
+| Настройка | Действие |
+| --- | --- |
+| **Enable Cerberus Neutralizer** | Включает мод. По умолчанию включено. |
+| **Disable Cerberus Detection** | Отключает сенсоры патруля и сбрасывает накопленное сенсорами обнаружение Ви при включении. По умолчанию включено. |
+| **Disable Cerberus Attacks** | Отключает запуск действия `CerberusBoss.CerberusAttacks` в режиме патруля. По умолчанию выключено. Уже начатый захват и удары, запускаемые сценой или триггером задания, обрабатывает игра. |
+| **Debug Mode** | Показывает ID найденной сущности, текущий профиль, показание обнаружения и состояние сенсоров. Переходы и ошибки записываются в журнал мода `CerberusNeutralizer.log` рядом с `init.lua`. |
+
+Настройки сохраняются в `settings.json` в папке мода. Если при перезагрузке модов из оверлея окно ждёт Cerberus, загрузите свой сейв ещё раз, чтобы мод получил событие появления робота.
+
+## Сюжетные сцены и удаление мода
+
+Мод проверяет активность `q305_bunker` и точную запись `Character.q305_cerberus_robot`. Профили сюжетной погони, сцены с участием робота и его постановочные анимации возвращают управление игре. При неизвестном профиле сенсоры работают по правилам игры. Мод не редактирует квестовые факты, инвентарь, сложность или данные других противников. Получение компонента Cerberus, чертежа Militech Canto Mk.6 и создание кибердеки остаются частью обычного прохождения.
+
+Если захват уже начался, загрузите ближайшее сохранение до захвата. На постановочных отрезках следуйте текущей цели, включая побег к шлюзу. Чтобы вернуть стандартное поведение, снимите галочку **Enable Cerberus Neutralizer** и закройте оверлей. Для удаления закройте игру и удалите папку `CerberusNeutralizer` из каталога `mods`.
+
+## Проверка
+
+Синтаксис и смена состояний проверены локально с имитацией CET. Методы компонентов и имена профилей сверены со скриптами игры 2.5 и индексом WolvenKit. Прогон внутри Cyberpunk 2077 2.5 ещё нужен для проверки прохождения терминалов, постановочных погонь, финала с Сойкой и получения предметов.
+
+```text
+lua tests/smoke.lua
+```
+
+- Совместимость CET с игрой и Lua-интерфейсы. [CET 1.38.0](https://github.com/maximegmd/CyberEngineTweaks/releases/tag/v1.38.0), [события CET](https://wiki.redmodding.org/scripting-cyberpunk/cyber-engine-tweaks/cet-functions/events), [реализация TweakDB в CET 1.38.1](https://github.com/maximegmd/CyberEngineTweaks/blob/v1.38.1/src/reverse/TweakDB/TweakDB.cpp).
+- Сигнатуры методов и переключение сенсоров. [Декомпиляция скриптов игры 2.5](https://codeberg.org/adamsmasher/cyberpunk/src/commit/17c62d000310f8938beb9593b3892c6c4febeffb), [RTTI компонента `senseComponent`](https://github.com/wopss/RED4ext.NativeDB/blob/master/src/assets/natives/classes/senseComponent.json).
+- Запись робота, журнал и параметры TweakDB. [Экспорт записей NPC](https://open2077.net/docs/npc-catalogue), [список путей журнала](https://github.com/CDPR-Modding-Documentation/Cyberpunk-Modding-Docs/blob/main/for-mod-creators-theory/references-lists-and-overviews/reference-quest-ids.md), [индекс имён TweakDB из WolvenKit](https://github.com/WolvenKit/WolvenKit/blob/95074158ed971aea39fc8abc50c2574381f4aad2/WolvenKit.Common/Resources/tweakdbstr.kark).
