@@ -1,6 +1,7 @@
 local mod = "bin/x64/plugins/cyber_engine_tweaks/mods/CerberusNeutralizer/init.lua"
 local robotRecord = "Character.q305_cerberus_robot"
 local relaxedPreset = "Senses.CerberusRelaxed"
+local defaultPreset = "Senses.Default"
 local introPreset = "Senses.Q303_Cerberus_Introduction_Chase"
 local bridgePreset = "Senses.Q303_Cerberus_Bridge_Chase"
 local attackRecord = "CerberusBoss.CerberusAttacks"
@@ -11,6 +12,7 @@ local function makeNPC(key, record, visual, hearing)
     local npc = { attached = true, inScene = false, inWorkspot = false, dead = false, senses = senses }
 
     function npc:IsA(class) return class == "NPCPuppet" end
+    function npc:IsPlayer() return record == "Player" end
     function npc:IsCerberus() return true end
     function npc:GetRecordID() return record end
     function npc:GetEntityID() return id end
@@ -36,17 +38,24 @@ end
 local function start(options)
     options = options or {}
     local state = { active = false, errors = {}, entities = {}, attackFlag = options.attackFlag or false }
-    local events, before, after = {}, {}, {}
+    local events, before, after, overrides = {}, {}, {}, {}
     local quest = {}
     local settingToChange, settingValue
 
     registerForEvent = function(event, fn) events[event] = fn end
     ObserveBefore = function(class, method, fn) before[class .. "." .. method] = fn end
     ObserveAfter = function(class, method, fn) after[class .. "." .. method] = fn end
+    Override = function(class, method, fn) overrides[class .. "." .. method] = fn end
     IsDefined = function(ref) return type(ref) == "table" end
     GetVersion = function() return options.cetVersion or "v1.38.1" end
     TweakDBID = { new = function(id) return id end }
     Enum = { new = function(class, value) return value end }
+    PlayerPuppet = {
+        GetSceneTier = function(player)
+            assert(not state.tierError, "simulated scene tier API error")
+            return player.tier or 1
+        end,
+    }
 
     spdlog = {
         info = function() end,
@@ -85,17 +94,6 @@ local function start(options)
             }
         end,
         FindEntityByID = function(id) return state.entities[id.hash] end,
-        GetSceneSystem = function()
-            assert(not state.sceneError, "simulated scene API error")
-            return {
-                GetScriptInterface = function()
-                    return { IsEntityInScene = function(_, id) return state.entities[id.hash].inScene end }
-                end,
-            }
-        end,
-        GetWorkspotSystem = function()
-            return { IsActorInWorkspot = function(_, npc) return npc.inWorkspot end }
-        end,
         GetTargetingSystem = function()
             return { GetLookAtObject = function() return state.lookAt end }
         end,
@@ -156,6 +154,27 @@ local function start(options)
         before["senseComponent.ToggleComponent"](npc.senses, enabled)
         npc.senses.visual, npc.senses.hearing = enabled, enabled
     end
+    state.processStimulus = function(npc, source, stimType, audio, direct)
+        local component = { GetOwnerPuppet = function() return npc end }
+        local data = { cachedEvt = {
+            sourceObject = source,
+            GetStimType = function() return stimType end,
+            IsAudio = function() return audio end,
+            IsVisual = function() return false end,
+            IsPurelyDirect = function() return false end,
+            IsTagInStimuli = function(_, tag)
+                assert(tag == "Direct")
+                return direct
+            end,
+        } }
+        local vanillaCalls = 0
+        overrides["ReactionManagerComponent.HandleStimEvent;StimEventTaskData"](component, data, function(arg)
+            assert(arg == data)
+            vanillaCalls = vanillaCalls + 1
+        end)
+        assert(vanillaCalls <= 1)
+        return vanillaCalls == 1
+    end
     return state
 end
 
@@ -171,10 +190,19 @@ state.attach(fake)
 state.tick()
 sensors(robot, true, true)
 state.load()
+robot.senses.preset = defaultPreset
+robot.inScene, robot.inWorkspot = true, true
+state.player.tier = 2
 state.tick()
 sensors(robot, false, false)
 sensors(fake, true, true)
 assert(robot.senses.resets == 1 and robot.senses.detection == 0 and not state.attackFlag)
+assert(not state.processStimulus(robot, state.player, "FootStepSprint", false, true))
+assert(not state.processStimulus(robot, state.player, "FootStepRegular", true, false))
+assert(not state.processStimulus(robot, state.player, "Gunshot", true, false))
+assert(state.processStimulus(fake, state.player, "FootStepSprint", true, false))
+assert(state.processStimulus(robot, fake, "FootStepSprint", true, false))
+assert(state.processStimulus(robot, state.player, "Gunshot", true, true))
 state.tick(0.01)
 assert(robot.senses.resets == 1)
 
@@ -185,6 +213,7 @@ for _, preset in ipairs({ introPreset, bridgePreset }) do
     state.preset(robot, preset)
     sensors(robot, true, true) -- Restore before the vanilla preset handler runs.
     assert(not state.attackFlag)
+    assert(state.processStimulus(robot, state.player, "FootStepSprint", true, false))
     state.tick()
     sensors(robot, true, true)
     state.preset(robot, relaxedPreset)
@@ -193,21 +222,24 @@ for _, preset in ipairs({ introPreset, bridgePreset }) do
     assert(state.attackFlag)
 end
 
-robot.inScene = true
+state.player.tier = 4
+assert(state.processStimulus(robot, state.player, "FootStepSprint", true, false))
 state.tick()
 sensors(robot, true, true)
 assert(not state.attackFlag)
-robot.inScene, robot.inWorkspot = false, true
+state.player.tier = 5
 state.tick()
 sensors(robot, true, true)
-robot.inWorkspot = false
+state.player.tier = 3
 state.tick()
 sensors(robot, false, false)
+assert(not state.processStimulus(robot, state.player, "FootStepSprint", true, false))
 
 state.set("Disable Cerberus Detection", false)
 state.tick()
 sensors(robot, true, true)
 assert(state.attackFlag)
+assert(state.processStimulus(robot, state.player, "FootStepSprint", true, false))
 state.set("Enable Cerberus Neutralizer", false)
 state.tick()
 assert(not state.attackFlag)
@@ -263,7 +295,7 @@ state.set("Disable Cerberus Attacks", true)
 state.tick()
 sensors(robot, false, false)
 assert(not state.attackFlag and #state.errors == 1)
-state.sceneError = true
+state.tierError = true
 state.tick()
 sensors(robot, true, true)
 assert(#state.errors == 2)
@@ -275,4 +307,4 @@ state.tick()
 assert(not state.attackFlag and #state.errors == 0)
 state.stop()
 
-print("PASS: identity, save reload, patrol, scene and chase guards, toggles, rollback, and API errors")
+print("PASS: identity, save reload, default patrol, sprint stimuli, cinematic and chase guards, toggles, rollback, and API errors")

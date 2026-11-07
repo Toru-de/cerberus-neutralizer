@@ -1,4 +1,4 @@
-local VERSION = "0.1.0"
+local VERSION = "0.1.1"
 local QUEST_PATH = "ep1/quests/main_quest/q305_bunker"
 local ROBOT_RECORD = "Character.q305_cerberus_robot"
 local ATTACK_RECORD = "CerberusBoss.CerberusAttacks"
@@ -8,10 +8,11 @@ local settings = { enabled = true, detection = true, attacks = false, debug = fa
 
 local tracked = {}
 local patrolPresets, chasePresets = {}, {}
+local movementStims = {}
 local robotRecord, activeQuestState
 local overlay, ready, fault = false, false, nil
 local attackAvailable, attackActive, ownsAttackFlat = false, false, false
-local attackFault
+local attackFault, stimulusFault
 local elapsed, pollSoon = 0, true
 local status = "Waiting for CET"
 
@@ -165,7 +166,7 @@ local function stopEffects()
         else
             slot.resetFor = nil
         end
-        slot.preset, slot.detection = nil, nil
+        slot.preset, slot.detection, slot.playerTier = nil, nil, nil
         setRobotStatus(slot, "Vanilla")
     end
 end
@@ -194,7 +195,12 @@ local function isPatrolPreset(preset)
     return false
 end
 
-local function checkRobot(slot, npc, playerID, scene, workspots)
+local function isGameplayTier(tier)
+    -- gamePSMHighLevel tiers 1–3 allow gameplay. Tiers 4–5 are cinematic.
+    return tier >= 1 and tier <= 3
+end
+
+local function checkRobot(slot, npc, playerID, playerTier)
     local senses = npc:GetSensesComponent()
     if npc:IsDead() then
         restoreRobot(slot, npc)
@@ -207,15 +213,16 @@ local function checkRobot(slot, npc, playerID, scene, workspots)
     end
 
     local preset = senses:GetCurrentPreset()
-    local scripted = scene:IsEntityInScene(slot.id) or workspots:IsActorInWorkspot(npc)
-    local eligible = not scripted and isPatrolPreset(preset)
+    -- Patrol animations also use workspots and may run in staged gameplay.
+    local gameplay = isGameplayTier(playerTier)
+    local eligible = gameplay and isPatrolPreset(preset)
     local suppressed = false
     if eligible and settings.detection then
         suppressed = suppressSensors(slot, senses, playerID)
     else
         restoreSensors(slot, senses)
-        if scripted then
-            setRobotStatus(slot, "Vanilla (scene or workspot)")
+        if not gameplay then
+            setRobotStatus(slot, "Vanilla (player outside gameplay tiers)")
         else
             setRobotStatus(slot, eligible and "Vanilla detection" or "Vanilla (non-patrol preset)")
         end
@@ -223,6 +230,7 @@ local function checkRobot(slot, npc, playerID, scene, workspots)
     if settings.debug then
         slot.preset = tostring(preset)
         slot.detection = senses:GetDetection(playerID)
+        slot.playerTier = playerTier
     end
     return eligible, suppressed
 end
@@ -260,16 +268,8 @@ local function update()
         return
     end
 
-    local sceneSystem = Game.GetSceneSystem()
-    local scene = IsDefined(sceneSystem) and sceneSystem:GetScriptInterface()
-    local workspots = Game.GetWorkspotSystem()
-    if not IsDefined(scene) or not IsDefined(workspots) then
-        stopEffects()
-        setStatus("Waiting for scene systems")
-        return
-    end
-
     local playerID = player:GetEntityID()
+    local playerTier = PlayerPuppet.GetSceneTier(player)
     local anyPatrol, anyProtected, anySuppressed = false, false, false
     for key, slot in pairs(tracked) do
         local npc = Game.FindEntityByID(slot.id)
@@ -277,7 +277,7 @@ local function update()
             tracked[key] = nil
             debugLog("Detached " .. key)
         else
-            local eligible, suppressed = checkRobot(slot, npc, playerID, scene, workspots)
+            local eligible, suppressed = checkRobot(slot, npc, playerID, playerTier)
             anyPatrol = anyPatrol or eligible
             anyProtected = anyProtected or not eligible
             anySuppressed = anySuppressed or suppressed
@@ -300,6 +300,27 @@ local function trackedSlot(npc)
     if next(tracked) ~= nil and IsDefined(npc) then
         return tracked[tostring(npc:GetEntityID().hash)]
     end
+end
+
+local function filterPatrolStimulus(component, data)
+    local npc = component:GetOwnerPuppet()
+    local slot = trackedSlot(npc)
+    if not slot or not slot.resetFor or not IsDefined(data) or not IsDefined(data.cachedEvt) then return false end
+    local stimulus = data.cachedEvt
+    local source = stimulus.sourceObject
+    if not IsDefined(source) or not source:IsPlayer() or tostring(source:GetEntityID().hash) ~= slot.resetFor then
+        return false
+    end
+    if not isRobot(npc) or not isGameplayTier(PlayerPuppet.GetSceneTier(source)) then return false end
+    local senses = npc:GetSensesComponent()
+    if not IsDefined(senses) or not isPatrolPreset(senses:GetCurrentPreset()) then return false end
+
+    local stimType = stimulus:GetStimType()
+    for _, movementStim in ipairs(movementStims) do
+        if stimType == movementStim then return true, slot end
+    end
+    if stimulus:IsPurelyDirect() or stimulus:IsTagInStimuli("Direct") then return false end
+    return stimulus:IsAudio() or stimulus:IsVisual(), slot
 end
 
 local function registerObservers()
@@ -352,6 +373,20 @@ local function registerObservers()
             if slot then slot.ownsVision = nil end
         end)
     end)
+
+    Override("ReactionManagerComponent", "HandleStimEvent;StimEventTaskData", function(component, data, wrapped)
+        if ready and not fault and not stimulusFault and settings.enabled and settings.detection and next(tracked) then
+            local ok, filtered, slot = pcall(filterPatrolStimulus, component, data)
+            if not ok then
+                stimulusFault = tostring(filtered)
+                spdlog.error(stimulusFault)
+            elseif filtered then
+                slot.filteredStims = (slot.filteredStims or 0) + 1
+                return
+            end
+        end
+        return wrapped(data)
+    end)
 end
 
 registerForEvent("onInit", function()
@@ -373,7 +408,7 @@ registerForEvent("onInit", function()
         activeQuestState = Enum.new("gameJournalEntryState", "Active")
         for _, name in ipairs({
             "Senses.CerberusRelaxed", "Senses.Q303_Cerberus_Alerted", "Senses.Q303_Cerberus_Combat",
-            "Senses.Relaxed", "Senses.Alerted", "Senses.Combat", "Senses.AbsoluteInstant",
+            "Senses.Default", "Senses.Relaxed", "Senses.Alerted", "Senses.Combat", "Senses.AbsoluteInstant",
         }) do
             patrolPresets[#patrolPresets + 1] = TweakDBID.new(name)
         end
@@ -383,6 +418,9 @@ registerForEvent("onInit", function()
         local initialPreset = TweakDB:GetFlat(ROBOT_RECORD .. ".sensePreset")
         if initialPreset and IsDefined(TweakDB:GetRecord(initialPreset)) then
             patrolPresets[#patrolPresets + 1] = initialPreset
+        end
+        for _, name in ipairs({ "FootStepRegular", "FootStepSprint", "LandingRegular", "LandingHard", "LandingVeryHard" }) do
+            movementStims[#movementStims + 1] = Enum.new("gamedataStimType", name)
         end
 
         attackAvailable = IsDefined(TweakDB:GetRecord(ATTACK_RECORD))
@@ -420,6 +458,7 @@ end
 registerForEvent("onDraw", function()
     if not overlay then return end
     if ImGui.Begin("Cerberus Neutralizer") then
+        ImGui.Text("v" .. VERSION)
         local enableChanged = checkbox("Enable Cerberus Neutralizer", "enabled")
         local detectionChanged = checkbox("Disable Cerberus Detection", "detection")
         ImGui.BeginDisabled(not attackAvailable)
@@ -434,6 +473,7 @@ registerForEvent("onDraw", function()
         ImGui.TextWrapped(status)
         if attackActive then ImGui.Text("Patrol attack action disabled") end
         if attackFault then ImGui.TextWrapped(attackFault) end
+        if stimulusFault then ImGui.TextWrapped("Stimulus filter unavailable. " .. stimulusFault) end
         if not attackAvailable and ownsAttackFlat then
             ImGui.TextWrapped("Could not restore the attack flag. Restart the game to restore it.")
         end
@@ -444,6 +484,8 @@ registerForEvent("onDraw", function()
                 ImGui.TextWrapped(key .. " | " .. slot.status)
                 if slot.preset then ImGui.TextWrapped("Preset: " .. slot.preset) end
                 if slot.detection then ImGui.Text(string.format("Detection: %.2f", slot.detection)) end
+                if slot.playerTier then ImGui.Text("Player scene tier " .. tostring(slot.playerTier)) end
+                ImGui.Text("Player stimuli filtered " .. tostring(slot.filteredStims or 0))
             end
         end
     end
